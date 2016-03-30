@@ -45,7 +45,7 @@ public class PartitionConsumer {
         m_replicaBrokers = new ArrayList<>();
     }
 
-    private SimpleConsumer initSimpleConsumer(){
+    private SimpleConsumer initSimpleConsumer() {
         // find the meta data about the topic and partition we are interested in
         //
         PartitionMetadata metadata = findLeader();
@@ -119,7 +119,7 @@ public class PartitionConsumer {
 
                 // TODO: your logic code
                 // if success
-                commitOffset(consumer, groupId, topic, partition, offset);
+                commitOffset(consumer, groupId, topic, partition, readOffset);
 
                 numRead++;
             }
@@ -134,7 +134,7 @@ public class PartitionConsumer {
         }
 //        if (consumer != null) consumer.close();
     }
-    
+
     public static boolean commitOffset(SimpleConsumer consumer, String groupId,
                                        String topic, int partition, long offset) {
         String clientName = "Client_" + topic + "_" + partition;
@@ -144,7 +144,8 @@ public class PartitionConsumer {
         OffsetAndMetadata offsetAndMetadata = new OffsetAndMetadata(offset, OffsetAndMetadata.NoMetadata(), -1L);
         requestInfo.put(topicAndPartition, offsetAndMetadata);
 
-        OffsetCommitRequest commitRequest = new OffsetCommitRequest(groupId, requestInfo, correlationId,clientName,kafka.api.OffsetRequest.CurrentVersion());
+        OffsetCommitRequest commitRequest = new OffsetCommitRequest(groupId, requestInfo,
+                correlationId, clientName, kafka.api.OffsetRequest.CurrentVersion());
 
         OffsetCommitResponse response = consumer.commitOffsets(commitRequest);
         return response.hasError();
@@ -158,13 +159,13 @@ public class PartitionConsumer {
 
         List<TopicAndPartition> requestInfo = new ArrayList<>();
         requestInfo.add(topicAndPartition);
-        OffsetFetchRequest fetchRequest = new OffsetFetchRequest(groupId,requestInfo,
+        OffsetFetchRequest fetchRequest = new OffsetFetchRequest(groupId, requestInfo,
                 kafka.api.OffsetRequest.CurrentVersion(), correlationId, clientName);
 
         OffsetFetchResponse response = consumer.fetchOffsets(fetchRequest);
 
         OffsetMetadataAndError offset = response.offsets().get(topicAndPartition);
-        if(offset.error() == 0)
+        if (offset.error() == 0)
             return offset.offset();
         else
             return 0;
@@ -173,7 +174,7 @@ public class PartitionConsumer {
     public static long getLastOffset(SimpleConsumer consumer, String topic, int partition,
                                      long whichTime, String clientName) {
         TopicAndPartition topicAndPartition = new TopicAndPartition(topic, partition);
-        Map<TopicAndPartition, PartitionOffsetRequestInfo> requestInfo = new HashMap<TopicAndPartition, PartitionOffsetRequestInfo>();
+        Map<TopicAndPartition, PartitionOffsetRequestInfo> requestInfo = new HashMap<>();
         requestInfo.put(topicAndPartition, new PartitionOffsetRequestInfo(whichTime, 1));
         kafka.javaapi.OffsetRequest request = new kafka.javaapi.OffsetRequest(
                 requestInfo, kafka.api.OffsetRequest.CurrentVersion(), clientName);
