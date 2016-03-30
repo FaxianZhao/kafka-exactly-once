@@ -119,7 +119,7 @@ public class PartitionConsumer {
 
                 // TODO: your logic code
                 // if success
-                commitOffset(readOffset);
+                commitOffset(consumer, groupId, topic, partition, offset);
 
                 numRead++;
             }
@@ -134,11 +134,7 @@ public class PartitionConsumer {
         }
 //        if (consumer != null) consumer.close();
     }
-
-    public boolean commitOffset(long offset) {
-        return commitOffset(consumer, groupId, topic, partition, offset);
-    }
-
+    
     public static boolean commitOffset(SimpleConsumer consumer, String groupId,
                                        String topic, int partition, long offset) {
         String clientName = "Client_" + topic + "_" + partition;
