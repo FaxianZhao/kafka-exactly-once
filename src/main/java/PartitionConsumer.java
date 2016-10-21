@@ -17,8 +17,12 @@ import java.util.*;
 /**
  * Created by Fasten on 2016/3/30.
  */
-public abstract class PartitionConsumer implements Runnable {
+public abstract class PartitionConsumer {
     private static final Logger logger = LoggerFactory.getLogger(PartitionConsumer.class);
+
+    private static final int BUFFER_SIZE = 209715200; // 200M
+
+    private static final long EXCEPTION_SLEEP_TIME = 180000; // 3 mins
 
     private static final int correlationId = 0;
     private List<String> m_replicaBrokers = new ArrayList();
@@ -50,16 +54,17 @@ public abstract class PartitionConsumer implements Runnable {
     }
 
     /**
-     * @param offset offset
-     * @param bytes  message
+     * @param offset   offset
+     * @param bytes    message
+     * @param consumer simple consumer
      * @return true for continue, false for break loop
      */
-    public boolean handleMessage(long offset, byte[] bytes) {
+    public boolean handleMessage(long offset, byte[] bytes, SimpleConsumer consumer) {
         return true;
     }
 
     public void release(SimpleConsumer consumer) {
-        if (consumer == null)
+        if (consumer != null)
             consumer.close();
     }
 
@@ -81,10 +86,10 @@ public abstract class PartitionConsumer implements Runnable {
         String leadBroker = metadata.leader().host();
         String clientName = "Client_" + topic + "_" + partition;
 
-        consumer = new SimpleConsumer(leadBroker, port, 100000, 65536, clientName);
+        consumer = new SimpleConsumer(leadBroker, port, 100000, BUFFER_SIZE, clientName);
 
         long lastReadOffset = getLastOffset(consumer, topic, partition, kafka.api.OffsetRequest.EarliestTime(), clientName);
-        logger.info("Earliest offset for partition {} : {}", partition, lastReadOffset);
+        logger.debug("Earliest offset for partition {} : {}", partition, lastReadOffset);
         if (readOffset > lastReadOffset) {
             lastReadOffset = readOffset;
         }
@@ -93,22 +98,53 @@ public abstract class PartitionConsumer implements Runnable {
 
         while (true) {
             if (consumer == null) {
-                consumer = new SimpleConsumer(leadBroker, port, 100000, 65536, clientName);
+                consumer = new SimpleConsumer(leadBroker, port, 100000, BUFFER_SIZE, clientName);
             }
             FetchRequest req = new FetchRequestBuilder()
                     .clientId(clientName)
-                    .addFetch(topic, partition, lastReadOffset, 100000).build();
+                    // Note: this fetchSize of 100000 might need to be increased if large batches are written to Kafka
+                    .addFetch(topic, partition, lastReadOffset, BUFFER_SIZE)
+                    .build();
 
-            FetchResponse fetchResponse = consumer.fetch(req);
+//            FetchResponse fetchResponse = consumer.fetch(req);
+            FetchResponse fetchResponse = null;
+
+            while (true) {
+                try {
+                    logger.debug("Partition {} fetch messages request", partition);
+
+                    fetchResponse = consumer.fetch(req);
+
+                    if (fetchResponse != null) {
+                        break;
+                    } else {
+                        logger.error("Fetch message response is null. It seems server error. Sleep 3 minutes.");
+                        Thread.sleep(EXCEPTION_SLEEP_TIME);
+                    }
+                } catch (Exception e) {
+                    logger.error("Some error occur when fetch messages. Sleep 3 minutes.", e);
+                    try {
+                        Thread.sleep(EXCEPTION_SLEEP_TIME);
+                    } catch (InterruptedException e1) {
+                        e1.printStackTrace();
+                    }
+                }
+            }
 
             if (fetchResponse.hasError()) {
                 ++numErrors;
-
+                // Something went wrong!
                 short code = fetchResponse.errorCode(topic, partition);
                 logger.warn("Error fetching data from the Broker:" + leadBroker + " Reason: " + code);
                 if (numErrors > 5) break;
                 if (code == ErrorMapping.OffsetOutOfRangeCode()) {
-                    lastReadOffset = getLastOffset(consumer, topic, partition, kafka.api.OffsetRequest.LatestTime(), clientName);
+                    // We asked for an invalid offset. For simple case ask for the last element to reset
+                    lastReadOffset = getLastOffset(
+                            consumer,
+                            topic,
+                            partition,
+                            kafka.api.OffsetRequest.LatestTime(),
+                            clientName);
                 }
 
                 consumer.close();
@@ -123,6 +159,19 @@ public abstract class PartitionConsumer implements Runnable {
 
             numErrors = 0;
 
+            if (fetchResponse.messageSet(topic, partition).sizeInBytes() == 0) {
+                // TODO exit??
+                logger.error("No enough data to consume, please check partition {} offset {}", partition, lastReadOffset);
+                logger.warn("Close consumer and sleep 3 minutes");
+                try {
+                    consumer.close();
+                    consumer = null;
+                    Thread.sleep(EXCEPTION_SLEEP_TIME);
+                } catch (InterruptedException ie) {
+                }
+                continue;
+            }
+
             long numRead = 0L;
             for (MessageAndOffset messageAndOffset : fetchResponse.messageSet(topic, partition)) {
                 long currentOffset = messageAndOffset.offset();
@@ -136,8 +185,7 @@ public abstract class PartitionConsumer implements Runnable {
                 byte[] bytes = new byte[payload.limit()];
                 payload.get(bytes);
 
-                // TODO
-                if (!handleMessage(messageAndOffset.offset(), bytes)) {
+                if (!handleMessage(messageAndOffset.offset(), bytes, consumer)) {
                     logger.debug("end for consume data");
                     release(consumer);
                     return;
@@ -162,6 +210,9 @@ public abstract class PartitionConsumer implements Runnable {
             else if (metadata.leader() == null)
                 goToSleep = true;
             else if ((oldLeader.equalsIgnoreCase(metadata.leader().host())) && (i == 0)) {
+                // first time through if the leader hasn't changed give ZooKeeper a second to recover
+                // second time, assume the broker did recover before failover, or it was a non-Broker issue
+                //
                 goToSleep = true;
             } else return metadata.leader().host();
 
@@ -183,7 +234,24 @@ public abstract class PartitionConsumer implements Runnable {
                 consumer = new SimpleConsumer(seed, port, 100000, 64 * 1024, "leaderLookup");
                 List<String> topics = Collections.singletonList(topic);
                 TopicMetadataRequest req = new TopicMetadataRequest(topics);
-                kafka.javaapi.TopicMetadataResponse resp = consumer.send(req);
+
+//                kafka.javaapi.TopicMetadataResponse resp = consumer.send(req);
+                kafka.javaapi.TopicMetadataResponse resp = null;
+                while (true) {
+                    try {
+                        logger.debug("Partition {} fetch topic meta request", partition);
+                        resp = consumer.send(req);
+                        if (resp != null)
+                            break;
+                    } catch (Exception e) {
+                        logger.error("Some error occur when fetch messages. Sleep 3 minutes.", e);
+                        try {
+                            Thread.sleep(EXCEPTION_SLEEP_TIME);
+                        } catch (InterruptedException e1) {
+                            e1.printStackTrace();
+                        }
+                    }
+                }
 
                 List<TopicMetadata> metaData = resp.topicsMetadata();
                 for (TopicMetadata item : metaData) {
@@ -228,7 +296,25 @@ public abstract class PartitionConsumer implements Runnable {
 
         OffsetCommitRequest commitRequest = new OffsetCommitRequest(groupId, requestInfo, correlationId, clientName, kafka.api.OffsetRequest.CurrentVersion());
 
-        OffsetCommitResponse response = consumer.commitOffsets(commitRequest);
+//        OffsetCommitResponse response = consumer.commitOffsets(commitRequest);
+        OffsetCommitResponse response = null;
+
+        while (true) {
+            try {
+                logger.debug("Partition {} commit offest request", partition);
+                response = consumer.commitOffsets(commitRequest);
+                if (response != null)
+                    break;
+            } catch (Exception e) {
+                logger.error("Some error occur when fetch messages. Sleep 3 minutes.", e);
+                try {
+                    Thread.sleep(EXCEPTION_SLEEP_TIME);
+                } catch (InterruptedException e1) {
+                    e1.printStackTrace();
+                }
+            }
+        }
+
         return response.hasError();
     }
 
@@ -251,7 +337,24 @@ public abstract class PartitionConsumer implements Runnable {
         OffsetFetchRequest fetchRequest = new OffsetFetchRequest(groupId, requestInfo,
                 kafka.api.OffsetRequest.CurrentVersion(), correlationId, clientName);
 
-        OffsetFetchResponse response = consumer.fetchOffsets(fetchRequest);
+//        OffsetFetchResponse response = consumer.fetchOffsets(fetchRequest);
+        OffsetFetchResponse response = null;
+
+        while (true) {
+            try {
+                logger.debug("Partition {} fetch offest request", partition);
+                response = consumer.fetchOffsets(fetchRequest);
+                if (response != null)
+                    break;
+            } catch (Exception e) {
+                logger.error("Some error occur when fetch messages. Sleep 3 minutes.", e);
+                try {
+                    Thread.sleep(EXCEPTION_SLEEP_TIME);
+                } catch (InterruptedException e1) {
+                    e1.printStackTrace();
+                }
+            }
+        }
 
         OffsetMetadataAndError offset = response.offsets().get(topicAndPartition);
         if (offset.error() == 0)
@@ -271,7 +374,24 @@ public abstract class PartitionConsumer implements Runnable {
         requestInfo.put(topicAndPartition, new PartitionOffsetRequestInfo(whichTime, 1));
         kafka.javaapi.OffsetRequest request = new kafka.javaapi.OffsetRequest(requestInfo, kafka.api.OffsetRequest.CurrentVersion(), clientName);
 
-        OffsetResponse response = consumer.getOffsetsBefore(request);
+//        OffsetResponse response = consumer.getOffsetsBefore(request);
+        OffsetResponse response = null;
+
+        while (true) {
+            try {
+                logger.debug("Partition {} fetch last offest request", partition);
+                response = consumer.getOffsetsBefore(request);
+                if (response != null)
+                    break;
+            } catch (Exception e) {
+                logger.error("Some error occur when fetch messages. Sleep 3 minutes.", e);
+                try {
+                    Thread.sleep(EXCEPTION_SLEEP_TIME);
+                } catch (InterruptedException e1) {
+                    e1.printStackTrace();
+                }
+            }
+        }
 
         if (response.hasError()) {
             logger.warn("Error fetching data Offset Data the Broker. Reason: {}", response.errorCode(topic, partition));
@@ -281,3 +401,4 @@ public abstract class PartitionConsumer implements Runnable {
         return offsets[0];
     }
 }
+
